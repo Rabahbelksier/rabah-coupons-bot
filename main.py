@@ -3,6 +3,8 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from functools import lru_cache
+from cachetools import TTLCache
 
 # ----------- إعدادات -----------
 APP_KEY, APP_SECRET = os.getenv('APP_KEY'), os.getenv('APP_SECRET')

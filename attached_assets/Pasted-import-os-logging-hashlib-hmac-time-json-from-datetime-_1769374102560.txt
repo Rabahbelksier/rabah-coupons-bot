@@ -1,0 +1,132 @@
+import os, logging, hashlib, hmac, time, json
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import requests
+
+APP_KEY, APP_SECRET = os.getenv('APP_KEY'), os.getenv('APP_SECRET')
+TRACKING_ID, TOKEN = os.getenv('TRACKING_ID'), os.getenv('TELEGRAM_TOKEN')
+if not all([APP_KEY, APP_SECRET, TRACKING_ID, TOKEN]): raise EnvironmentError("❌ Missing required environment variables")
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def generate_sign(params, app_secret):
+    return hmac.new(app_secret.encode(), ''.join(f"{k}{v}" for k, v in sorted(params.items())).encode(), hashlib.sha256).hexdigest().upper()
+
+def send_api_request_with_retry(all_params, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            response = requests.post("https://api-sg.aliexpress.com/sync", data=all_params, timeout=10)
+            if response.status_code != 200:
+                if attempt < max_retries - 1: time.sleep(1); continue
+            data = response.json()
+            if 'error_response' in data:
+                if data['error_response'].get('code') == 'ApiCallLimit':
+                    ban_time = 5 if '5 seconds' in data['error_response'].get('msg','') else 1
+                    if attempt < max_retries - 1: time.sleep(ban_time + 0.5); continue
+                return data
+            return data
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1: time.sleep(2); continue
+        except Exception as e:
+            if attempt < max_retries - 1: time.sleep(1); continue
+    return {'error_response': {'code': 'MaxRetriesExceeded', 'msg': 'فشلت جميع المحاولات'}}
+
+def extract_product_id(url): return url.split('/item/')[1].split('.')[0] if '/item/' in url else url
+
+def prepare_api_params(product_id):
+    params = {'method': 'aliexpress.affiliate.productdetail.get', 'app_key': APP_KEY, 'sign_method': 'sha256',
+              'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'), 'format': 'json', 'v': '2.0', 'product_ids': product_id,
+              'target_currency': 'USD', 'target_language': 'EN', 'tracking_id': TRACKING_ID}
+    return {**params, 'sign': generate_sign(params, APP_SECRET)}
+
+def parse_product_data(product_data):
+    try:
+        product = product_data['aliexpress_affiliate_productdetail_get_response']['resp_result']['result']['products'].get('product')
+        if not product: return {}
+        p = product[0] if isinstance(product, list) else product
+        sale_price = p.get('target_sale_price', p.get('app_sale_price', 'غير متوفر'))
+        original_price = p.get('target_original_price', p.get('original_price', 'غير متوفر'))
+        discount = p.get('target_discount', 'غير محسوب')
+        if discount == 'غير محسوب' and original_price != 'غير متوفر' and sale_price != 'غير متوفر':
+            try:
+                original = float(str(original_price).replace('USD', '').replace('$', '').strip())
+                sale = float(str(sale_price).replace('USD', '').replace('$', '').strip())
+                if original > 0: discount = f"{((original - sale) / original) * 100:.1f}%"
+            except: pass
+        shop_url = p.get('shop_url', 'غير متوفر')
+        if '/store/' in shop_url:
+            try: shop_url = f"https://m.aliexpress.com/store/{shop_url.split('/store/')[1].split('/')[0].split('?')[0]}?shopId={shop_url.split('/store/')[1].split('/')[0].split('?')[0]}"
+            except: pass
+        return {'product_title': p.get('product_title', 'غير متوفر'), 'target_sale_price': f"{sale_price} USD",
+                'target_original_price': f"{original_price} USD", 'target_discount': discount,
+                'lastest_volume': p.get('lastest_volume', 'غير متوفر'), 'shop_name': p.get('shop_name', 'غير متوفر'),
+                'evaluate_rate': p.get('evaluate_rate', 'غير متوفر'), 'shop_url': shop_url,
+                'first_level_category_name': p.get('first_level_category_name', 'غير محدد'),
+                'second_level_category_name': p.get('second_level_category_name', 'غير محدد'),
+                'commission_rate': p.get('commission_rate', 'غير محدد')}
+    except: return {}
+
+def format_product_message(info):
+    return f"""📦 **تفاصيل المنتج الكاملة**
+🛒 **الاسم:** {info['product_title']}
+💰 **السعر الحالي:** {info['target_sale_price']}
+🏷️ **السعر الأصلي:** {info['target_original_price']}
+🎁 **نسبة الخصم:** {info['target_discount']}
+📊 **عدد الطلبات:** {info['lastest_volume']}
+📂 **معلومات المتجر:** 
+🏪 **اسم المتجر:** {info['shop_name']}
+📊 **معدل تقييم المتجر:** {info['evaluate_rate']}
+🔗 **رابط المتجر:** {info['shop_url']}
+📂 **معلومات إضافية:**
+   • الفئة الرئيسية: {info['first_level_category_name']}
+   • الفئة الفرعية: {info['second_level_category_name']}
+💡 **نسبة العمولة:** {info['commission_rate']}
+⏰ *تم الاستخراج في: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}*"""
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'aliexpress.com/item' not in (msg := update.message.text.strip()):
+        await update.message.reply_text("⚠️ يُرجى إرسال رابط منتج صالح من AliExpress فقط."); return
+    await update.message.reply_text("جاري الحصول على جميع تفاصيل المنتج المتوفرة… ⏳")
+    try:
+        params = prepare_api_params(extract_product_id(msg))
+        data = send_api_request_with_retry(params, max_retries=3)
+        if 'error_response' in data:
+            if data['error_response'].get('code') == 'MaxRetriesExceeded':
+                await update.message.reply_text("❌ فشل الاتصال بالخادم بعد عدة محاولات.")
+            else: await update.message.reply_text(f"❌ خطأ من API: {data['error_response'].get('msg', 'خطأ غير معروف')}")
+            return
+        if not (info := parse_product_data(data)):
+            await update.message.reply_text("⚠️ خطا من المصدر: Aliexpress ترفض الوصول الى بيانات هذا المنتج"); return
+        await update.message.reply_text(format_product_message(info), parse_mode='Markdown')
+    except Exception as e: logger.error(f"خطأ عام: {e}"); await update.message.reply_text("❌ حدث خطأ غير متوقع.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("مرحبًا! 👋 أرسل رابط منتج من AliExpress للحصول على تفاصيله.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("""📚 **كيفية الاستخدام:**
+1. أرسل رابط منتج من AliExpress
+2. انتظر الحصول على التفاصيل
+
+📝 **مثال للرابط:**
+https://www.aliexpress.com/item/1005001234567890.html
+
+🤖 **الأوامر المتاحة:**
+/start - بدء البوت
+/help - عرض هذه المساعدة""")
+
+def main():
+    logger.info("✅ بدء تشغيل البوت...")
+    try:
+        app = Application.builder().token(TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        logger.info("✅ البوت يعمل وجاهز لاستقبال الرسائل...")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except Exception as e: logger.error(f"❌ فشل تشغيل البوت: {e}")
+
+if __name__ == '__main__':
+    main()

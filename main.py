@@ -494,30 +494,22 @@ async def product_details_callback(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("❌ حدث خطأ غير متوقع أثناء جلب التفاصيل.")
 
 
-telegram_app = Application.builder().token(TOKEN).build()
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-telegram_app.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
-
 _loop = asyncio.new_event_loop()
 _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
 _loop_thread.start()
 
-_initialized = False
-_init_lock = threading.Lock()
+telegram_app = Application.builder().token(TOKEN).updater(None).build()
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+telegram_app.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
 
+_init_future = asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _loop)
+_init_future.result(timeout=30)
+logger.info("Telegram app initialized successfully")
 
-def ensure_initialized():
-    global _initialized
-    if _initialized:
-        return
-    with _init_lock:
-        if _initialized:
-            return
-        future = asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _loop)
-        future.result(timeout=30)
-        _initialized = True
-        logger.info("Telegram app initialized")
+_start_future = asyncio.run_coroutine_threadsafe(telegram_app.start(), _loop)
+_start_future.result(timeout=30)
+logger.info("Telegram app started successfully")
 
 
 @app.route('/')
@@ -528,7 +520,6 @@ def index():
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     try:
-        ensure_initialized()
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
         future = asyncio.run_coroutine_threadsafe(
@@ -537,7 +528,7 @@ def webhook():
         future.result(timeout=60)
         return Response(status=200)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return Response(status=200)
 
 

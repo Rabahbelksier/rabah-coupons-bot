@@ -1,12 +1,14 @@
 # AliExpress Telegram Bot
 
 ## Overview
-Telegram bot that generates affiliate links for AliExpress products. Users send product URLs and receive discount offers with affiliate links.
+Telegram bot that generates affiliate links for AliExpress products. Users send product URLs and receive discount offers with affiliate links. Configured to run on Render.com using Webhook mode with Flask and PostgreSQL.
 
 ## Architecture
-- **main.py**: Single-file bot using `python-telegram-bot` library
+- **main.py**: Flask web app with Telegram Webhook integration
 - **API**: AliExpress Affiliate API (`api-sg.aliexpress.com/sync`)
 - **Scraping**: BeautifulSoup fallback for product info
+- **Database**: PostgreSQL via psycopg2 for user storage
+- **Deployment**: Render.com (free plan) with gunicorn
 
 ## Key Functions
 - `get_product_info_from_api(product_id)`: Primary method - fetches title & image via AliExpress API
@@ -14,6 +16,9 @@ Telegram bot that generates affiliate links for AliExpress products. Users send 
 - `parse_product_data(data)`: Parses full product details from API response (used in details callback)
 - `generate_affiliate_links(product_id)`: Generates affiliate links for various offer types
 - `extract_product_id(url)`: Extracts product ID from various AliExpress URL formats
+- `save_user(chat_id, first_name, last_name)`: Saves user data to PostgreSQL on /start
+- `init_db()`: Creates user_bot table if not exists
+- `set_webhook()`: Configures Telegram webhook URL
 
 ## Flow
 1. User sends AliExpress URL
@@ -22,14 +27,26 @@ Telegram bot that generates affiliate links for AliExpress products. Users send 
 4. Generates affiliate links
 5. Sends message with product image, title, and offer links
 6. User can click "تفاصيل المنتج الكاملة" for full details via API
+7. On /start command, user info saved to PostgreSQL
 
 ## Environment Variables
 - `APP_KEY`: AliExpress API key
 - `APP_SECRET`: AliExpress API secret
 - `TRACKING_ID`: Affiliate tracking ID
 - `TELEGRAM_TOKEN`: Telegram bot token
+- `DATABASE_URL`: PostgreSQL connection string
+- `PORT`: Server port (default 5000)
+- `RENDER_EXTERNAL_URL`: Render external URL for webhook setup
+
+## Database Schema
+- **user_bot** table: first_name (TEXT), last_name (TEXT), chat_id (BIGINT PRIMARY KEY)
+
+## Deployment Files
+- `requirements.txt`: Python dependencies
+- `Procfile`: `web: gunicorn main:app`
 
 ## Recent Changes
-- 2026-02-12: Added `get_product_info_from_api` for fetching title/image via API
-- 2026-02-12: Fixed and improved scraping function (renamed to `get_product_details_scraping`), made it secondary
-- 2026-02-12: Updated `handle_message` to use API first, scraping as fallback, display title & image with offers
+- 2026-02-12: Converted from polling to Webhook mode with Flask
+- 2026-02-12: Added PostgreSQL database integration for user storage
+- 2026-02-12: Created Procfile and updated requirements.txt for Render.com deployment
+- 2026-02-12: Added save_user function with ON CONFLICT DO NOTHING for duplicate prevention

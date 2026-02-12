@@ -1,41 +1,114 @@
-import os, re, hmac, hashlib, requests, time, json
+import os
+import re
+import hmac
+import hashlib
+import requests
+import time
+import json
+import logging
+import asyncio
+import threading
+import psycopg2
 from datetime import datetime
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from functools import lru_cache
 from cachetools import TTLCache
+from flask import Flask, request, Response
 
-# ----------- إعدادات -----------
-APP_KEY, APP_SECRET = os.getenv('APP_KEY'), os.getenv('APP_SECRET')
-TRACKING_ID, TOKEN = os.getenv('TRACKING_ID'), os.getenv('TELEGRAM_TOKEN')
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+APP_KEY = os.getenv('APP_KEY')
+APP_SECRET = os.getenv('APP_SECRET')
+TRACKING_ID = os.getenv('TRACKING_ID')
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
+PORT = int(os.getenv('PORT', 5000))
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '')
 API_URL = "https://api-sg.aliexpress.com/sync"
 
 if not all([APP_KEY, APP_SECRET, TRACKING_ID, TOKEN]):
-    raise EnvironmentError("❌ Missing required environment variables")
+    raise EnvironmentError("Missing required environment variables")
 
-# ----------- كاش مع TTL -----------
+app = Flask(__name__)
+
 cache = TTLCache(maxsize=1000, ttl=300)
 
-# ----------- دوال مساعدة لـ API AliExpress -----------
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set, skipping database initialization")
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_bot (
+                first_name TEXT,
+                last_name TEXT,
+                chat_id BIGINT PRIMARY KEY
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+
+
+def save_user(chat_id, first_name, last_name):
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_bot (chat_id, first_name, last_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id) DO NOTHING
+        """, (chat_id, first_name, last_name))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving user: {e}")
+
+
 def send_api_request_with_retry(all_params, max_retries=2):
     for attempt in range(max_retries):
         try:
             response = requests.post(API_URL, data=all_params, timeout=10)
             if response.status_code != 200:
-                if attempt < max_retries - 1: time.sleep(1); continue
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
             data = response.json()
             if 'error_response' in data:
                 if data['error_response'].get('code') == 'ApiCallLimit':
-                    ban_time = 5 if '5 seconds' in data['error_response'].get('msg','') else 1
-                    if attempt < max_retries - 1: time.sleep(ban_time + 0.5); continue
+                    ban_time = 5 if '5 seconds' in data['error_response'].get('msg', '') else 1
+                    if attempt < max_retries - 1:
+                        time.sleep(ban_time + 0.5)
+                        continue
                 return data
             return data
         except requests.exceptions.Timeout:
-            if attempt < max_retries - 1: time.sleep(2); continue
-        except Exception as e:
-            if attempt < max_retries - 1: time.sleep(1); continue
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
     return {'error_response': {'code': 'MaxRetriesExceeded', 'msg': 'فشلت جميع المحاولات'}}
+
 
 def prepare_api_params(method, extra_params):
     params = {
@@ -50,10 +123,12 @@ def prepare_api_params(method, extra_params):
     params['sign'] = generate_api_signature(params, APP_SECRET)
     return params
 
+
 def parse_product_data(product_data):
     try:
         product = product_data['aliexpress_affiliate_productdetail_get_response']['resp_result']['result']['products'].get('product')
-        if not product: return {}
+        if not product:
+            return {}
         p = product[0] if isinstance(product, list) else product
         sale_price = p.get('target_sale_price', p.get('app_sale_price', 'غير متوفر'))
         original_price = p.get('target_original_price', p.get('original_price', 'غير متوفر'))
@@ -62,12 +137,17 @@ def parse_product_data(product_data):
             try:
                 original = float(str(original_price).replace('USD', '').replace('$', '').strip())
                 sale = float(str(sale_price).replace('USD', '').replace('$', '').strip())
-                if original > 0: discount = f"{((original - sale) / original) * 100:.1f}%"
-            except: pass
+                if original > 0:
+                    discount = f"{((original - sale) / original) * 100:.1f}%"
+            except Exception:
+                pass
         shop_url = p.get('shop_url', 'غير متوفر')
         if '/store/' in shop_url:
-            try: shop_url = f"https://m.aliexpress.com/store/{shop_url.split('/store/')[1].split('/')[0].split('?')[0]}?shopId={shop_url.split('/store/')[1].split('/')[0].split('?')[0]}"
-            except: pass
+            try:
+                store_id = shop_url.split('/store/')[1].split('/')[0].split('?')[0]
+                shop_url = f"https://m.aliexpress.com/store/{store_id}?shopId={store_id}"
+            except Exception:
+                pass
         return {
             'product_title': p.get('product_title', 'غير متوفر'),
             'target_sale_price': f"{sale_price} USD",
@@ -81,7 +161,9 @@ def parse_product_data(product_data):
             'second_level_category_name': p.get('second_level_category_name', 'غير محدد'),
             'commission_rate': p.get('commission_rate', 'غير محدد')
         }
-    except: return {}
+    except Exception:
+        return {}
+
 
 def get_product_info_from_api(product_id):
     try:
@@ -94,7 +176,7 @@ def get_product_info_from_api(product_id):
         })
         data = send_api_request_with_retry(params, max_retries=3)
         if 'error_response' in data:
-            print(f"API error in get_product_info_from_api: {data['error_response'].get('msg', 'unknown')}")
+            logger.error(f"API error in get_product_info_from_api: {data['error_response'].get('msg', 'unknown')}")
             return None
         product = data.get('aliexpress_affiliate_productdetail_get_response', {}).get('resp_result', {}).get('result', {}).get('products', {}).get('product')
         if not product:
@@ -111,8 +193,9 @@ def get_product_info_from_api(product_id):
             'image_url': image_url if image_url else None
         }
     except Exception as e:
-        print(f"خطأ في get_product_info_from_api: {e}")
+        logger.error(f"Error in get_product_info_from_api: {e}")
         return None
+
 
 def format_product_message(info):
     return f"""📦 **تفاصيل المنتج الكاملة**
@@ -134,7 +217,7 @@ def format_product_message(info):
 
 ⏰ *تم الاستخراج في: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}*"""
 
-# ----------- معالجة الروابط -----------
+
 @lru_cache(maxsize=100)
 def extract_product_id(text):
     try:
@@ -143,7 +226,7 @@ def extract_product_id(text):
         session = requests.Session()
         response = session.head(text, allow_redirects=True, timeout=10)
         final_url = response.url
-    except:
+    except Exception:
         final_url = text
 
     patterns = [
@@ -164,12 +247,12 @@ def extract_product_id(text):
             return match.group(1)
     return None
 
-# ----------- توليد التوقيع -----------
+
 def generate_api_signature(params, secret):
     param_string = ''.join([f"{k}{v}" for k, v in sorted(params.items())])
     return hmac.new(secret.encode('utf-8'), param_string.encode('utf-8'), hashlib.sha256).hexdigest().upper()
 
-# ----------- توليد الروابط -----------
+
 def generate_affiliate_links(product_id):
     cache_key = f"links_{product_id}"
     if cache_key in cache:
@@ -219,7 +302,7 @@ def generate_affiliate_links(product_id):
             if result.get('promotion_links'):
                 return result['promotion_links']['promotion_link'][0]['promotion_link']
         except Exception as e:
-            print(f"خطأ في توليد الرابط: {e}")
+            logger.error(f"Error generating link: {e}")
         return None
 
     results = []
@@ -236,7 +319,7 @@ def generate_affiliate_links(product_id):
     cache[cache_key] = results
     return results
 
-# ----------- معلومات المنتج باستخدام BeautifulSoup (وظيفة ثانوية/احتياطية) -----------
+
 @lru_cache(maxsize=50)
 def get_product_details_scraping(product_id):
     try:
@@ -271,7 +354,7 @@ def get_product_details_scraping(product_id):
                 if title and image_url:
                     break
         except Exception as e:
-            print(f"خطأ في تحليل JavaScript: {e}")
+            logger.error(f"Error parsing JavaScript: {e}")
 
         if not title or not image_url:
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -308,13 +391,16 @@ def get_product_details_scraping(product_id):
             'image_url': image_url
         }
     except Exception as e:
-        print(f"خطأ في استخراج معلومات المنتج (scraping): {e}")
+        logger.error(f"Error in scraping: {e}")
         return {'title': None, 'image_url': None}
 
-# ----------- أوامر البوت -----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user.id, user.first_name, user.last_name or '')
     start_text = "⚙️مرحبا بك في بوت التخفيض الخاص بالمتجر الصيني الشهير Aliexpress..."
     await update.message.reply_text(start_text)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text
@@ -337,7 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product = get_product_info_from_api(product_id)
 
         if not product or (not product.get('title') or product.get('title') == 'غير متوفر'):
-            print(f"API لم تُرجع بيانات كافية للمنتج {product_id}، جاري المحاولة عبر scraping...")
+            logger.info(f"API returned insufficient data for {product_id}, trying scraping...")
             scraped = get_product_details_scraping(product_id)
             if not product:
                 product = {'title': None, 'image_url': None}
@@ -363,57 +449,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await update.message.reply_photo(photo=image_url, caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
             except Exception as photo_err:
-                print(f"فشل إرسال الصورة: {photo_err}")
+                logger.error(f"Failed to send photo: {photo_err}")
                 await update.message.reply_text(response_text, reply_markup=reply_markup)
         else:
             await update.message.reply_text(response_text, reply_markup=reply_markup)
 
     except Exception as e:
-        print(f"خطأ عام في handle_message: {e}")
+        logger.error(f"Error in handle_message: {e}")
         await update.message.reply_text("❌ حدث خطأ أثناء معالجة طلبك")
+
 
 async def product_details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     product_id = query.data.split('_')[1]
-    
+
     try:
         await query.edit_message_reply_markup(reply_markup=None)
         status_message = await query.message.reply_text("⏳ جاري جلب التفاصيل الكاملة من AliExpress...")
-        
+
         params = prepare_api_params('aliexpress.affiliate.productdetail.get', {
             'product_ids': product_id,
             'target_currency': 'USD',
             'target_language': 'EN',
             'tracking_id': TRACKING_ID
         })
-        
+
         data = send_api_request_with_retry(params, max_retries=3)
-        
+
         if 'error_response' in data:
             await status_message.edit_text(f"❌ خطأ من AliExpress: {data['error_response'].get('msg', 'خطأ غير معروف')}")
             return
-            
+
         info = parse_product_data(data)
         if not info:
             await status_message.edit_text("⚠️ فشل في تحليل بيانات المنتج. قد يكون المنتج غير متاح في نظام الأفلييت.")
             return
-            
+
         await status_message.edit_text(format_product_message(info), parse_mode='Markdown', disable_web_page_preview=True)
-        
+
     except Exception as e:
-        print(f"خطأ في callback التفاصيل: {e}")
+        logger.error(f"Error in details callback: {e}")
         await query.message.reply_text("❌ حدث خطأ غير متوقع أثناء جلب التفاصيل.")
 
-# ----------- تشغيل البوت -----------
-def main():
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
-    print("✅ البوت يعمل...")
-    application.run_polling()
+
+telegram_app = Application.builder().token(TOKEN).build()
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+telegram_app.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
+
+_loop = asyncio.new_event_loop()
+_loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
+_loop_thread.start()
+
+_initialized = False
+_init_lock = threading.Lock()
+
+
+def ensure_initialized():
+    global _initialized
+    if _initialized:
+        return
+    with _init_lock:
+        if _initialized:
+            return
+        future = asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _loop)
+        future.result(timeout=30)
+        _initialized = True
+        logger.info("Telegram app initialized")
+
+
+@app.route('/')
+def index():
+    return 'Bot is running'
+
+
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    try:
+        ensure_initialized()
+        json_data = request.get_json(force=True)
+        update = Update.de_json(json_data, telegram_app.bot)
+        future = asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update), _loop
+        )
+        future.result(timeout=60)
+        return Response(status=200)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return Response(status=200)
+
+
+def set_webhook():
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{TOKEN}"
+        url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}"
+        response = requests.get(url)
+        logger.info(f"Webhook set response: {response.json()}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
+
+
+init_db()
+set_webhook()
 
 if __name__ == '__main__':
-    main()
+    app.run(host='0.0.0.0', port=PORT)

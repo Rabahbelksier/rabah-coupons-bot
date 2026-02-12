@@ -1,4 +1,4 @@
-requests==2.31.0
-beautifulsoup4==4.12.2
-python-telegram-bot==20.6  # استخدم 20.6 بدل 20.7
-cachetools==5.3.2
+requests
+beautifulsoup4
+python-telegram-bot==20.7
+cachetools

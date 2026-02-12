@@ -83,6 +83,37 @@ def parse_product_data(product_data):
         }
     except: return {}
 
+def get_product_info_from_api(product_id):
+    try:
+        params = prepare_api_params('aliexpress.affiliate.productdetail.get', {
+            'product_ids': product_id,
+            'target_currency': 'USD',
+            'target_language': 'EN',
+            'tracking_id': TRACKING_ID,
+            'fields': 'product_title,product_main_image_url'
+        })
+        data = send_api_request_with_retry(params, max_retries=3)
+        if 'error_response' in data:
+            print(f"API error in get_product_info_from_api: {data['error_response'].get('msg', 'unknown')}")
+            return None
+        product = data.get('aliexpress_affiliate_productdetail_get_response', {}).get('resp_result', {}).get('result', {}).get('products', {}).get('product')
+        if not product:
+            return None
+        p = product[0] if isinstance(product, list) else product
+        title = p.get('product_title', '')
+        image_url = p.get('product_main_image_url', '')
+        if image_url and image_url.startswith('//'):
+            image_url = f"https:{image_url}"
+        if not title and not image_url:
+            return None
+        return {
+            'title': title.strip()[:255] if title else 'غير متوفر',
+            'image_url': image_url if image_url else None
+        }
+    except Exception as e:
+        print(f"خطأ في get_product_info_from_api: {e}")
+        return None
+
 def format_product_message(info):
     return f"""📦 **تفاصيل المنتج الكاملة**
 🛒 **الاسم:** {info['product_title']}
@@ -205,56 +236,80 @@ def generate_affiliate_links(product_id):
     cache[cache_key] = results
     return results
 
-# ----------- معلومات المنتج باستخدام BeautifulSoup -----------
+# ----------- معلومات المنتج باستخدام BeautifulSoup (وظيفة ثانوية/احتياطية) -----------
 @lru_cache(maxsize=50)
-def get_product_details(product_id):
+def get_product_details_scraping(product_id):
     try:
         url = f"https://www.aliexpress.com/item/{product_id}.html"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Referer": "https://www.aliexpress.com/",
         }
 
-        response = requests.get(url, headers=headers, timeout=15)
+        session = requests.Session()
+        response = session.get(url, headers=headers, timeout=20)
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
 
         title = None
-        title_element = soup.find('h1', {'class': 'product-title-text'})
-        if title_element:
-            title = title_element.get_text(strip=True)
-
-        if not title:
-            meta_title = soup.find('meta', {'property': 'og:title'})
-            if meta_title:
-                title = meta_title.get('content', '')
-
-        if not title:
-            title_element = soup.find('title')
-            if title_element:
-                title = title_element.get_text(strip=True)
-
         image_url = None
-        image_element = soup.find('img', {'class': 'magnifier-image'})
-        if image_element:
-            image_url = image_element.get('src') or image_element.get('data-src')
 
-        if not image_url:
-            meta_image = soup.find('meta', {'property': 'og:image'})
-            if meta_image:
-                image_url = meta_image.get('content')
+        try:
+            script_tags = re.findall(r'<script[^>]*>(.*?)</script>', response.text, re.DOTALL)
+            for script in script_tags:
+                title_match = re.search(r'"subject"\s*:\s*"([^"]+)"', script)
+                if title_match:
+                    title = title_match.group(1)
+                img_match = re.search(r'"imageUrl"\s*:\s*"([^"]+)"', script)
+                if not img_match:
+                    img_match = re.search(r'"imagePathList"\s*:\s*\[\s*"([^"]+)"', script)
+                if img_match:
+                    image_url = img_match.group(1)
+                if title and image_url:
+                    break
+        except Exception as e:
+            print(f"خطأ في تحليل JavaScript: {e}")
+
+        if not title or not image_url:
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            if not title:
+                meta_title = soup.find('meta', {'property': 'og:title'})
+                if meta_title:
+                    title = meta_title.get('content', '')
+
+            if not title:
+                title_tag = soup.find('title')
+                if title_tag:
+                    raw_title = title_tag.get_text(strip=True)
+                    if raw_title and 'AliExpress' not in raw_title[:10]:
+                        title = raw_title.split('|')[0].split('-')[0].strip()
+
+            if not image_url:
+                meta_image = soup.find('meta', {'property': 'og:image'})
+                if meta_image:
+                    image_url = meta_image.get('content')
+
+            if not image_url:
+                for img in soup.find_all('img'):
+                    src = img.get('src') or img.get('data-src') or ''
+                    if 'ae01.alicdn.com' in src or 'cbu01.alicdn.com' in src:
+                        image_url = src
+                        break
 
         if image_url and image_url.startswith('//'):
             image_url = f"https:{image_url}"
 
         return {
-            'title': title.strip()[:255] if title else 'تعذر استخراج العنوان',
+            'title': title.strip()[:255] if title else None,
             'image_url': image_url
         }
     except Exception as e:
-        print(f"خطأ في استخراج معلومات المنتج: {e}")
-        return {'title': 'تعذر استخراج العنوان', 'image_url': None}
+        print(f"خطأ في استخراج معلومات المنتج (scraping): {e}")
+        return {'title': None, 'image_url': None}
 
 # ----------- أوامر البوت -----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,18 +333,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("⏳ جاري البحث عن العروض")
-        product = get_product_details(product_id)
+
+        product = get_product_info_from_api(product_id)
+
+        if not product or (not product.get('title') or product.get('title') == 'غير متوفر'):
+            print(f"API لم تُرجع بيانات كافية للمنتج {product_id}، جاري المحاولة عبر scraping...")
+            scraped = get_product_details_scraping(product_id)
+            if not product:
+                product = {'title': None, 'image_url': None}
+            if scraped.get('title'):
+                product['title'] = product.get('title') if product.get('title') and product.get('title') != 'غير متوفر' else scraped['title']
+            if scraped.get('image_url') and not product.get('image_url'):
+                product['image_url'] = scraped['image_url']
+
         links = generate_affiliate_links(product_id)
 
         keyboard = [[InlineKeyboardButton("📋 تفاصيل المنتج الكاملة", callback_data=f"details_{product_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        response_text = f"📦تخفيض على:\n {product['title']}\n\n" + "\n\n".join(links) if product['title'] != 'تعذر استخراج العنوان' else "📦 تخفيض على منتج AliExpress\n\n" + "\n\n".join(links)
+        title = product.get('title') if product and product.get('title') else None
+        image_url = product.get('image_url') if product else None
 
-        if product['image_url']:
+        if title:
+            response_text = f"📦تخفيض على:\n {title}\n\n" + "\n\n".join(links)
+        else:
+            response_text = "📦 تخفيض على منتج AliExpress\n\n" + "\n\n".join(links)
+
+        if image_url:
             try:
-                await update.message.reply_photo(photo=product['image_url'], caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
-            except:
+                await update.message.reply_photo(photo=image_url, caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
+            except Exception as photo_err:
+                print(f"فشل إرسال الصورة: {photo_err}")
                 await update.message.reply_text(response_text, reply_markup=reply_markup)
         else:
             await update.message.reply_text(response_text, reply_markup=reply_markup)

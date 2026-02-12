@@ -494,22 +494,33 @@ async def product_details_callback(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("❌ حدث خطأ غير متوقع أثناء جلب التفاصيل.")
 
 
-_loop = asyncio.new_event_loop()
-_loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
-_loop_thread.start()
-
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 telegram_app.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
 
-_init_future = asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _loop)
-_init_future.result(timeout=30)
-logger.info("Telegram app initialized successfully")
+_loop = None
+_initialized = False
+_init_lock = threading.Lock()
 
-_start_future = asyncio.run_coroutine_threadsafe(telegram_app.start(), _loop)
-_start_future.result(timeout=30)
-logger.info("Telegram app started successfully")
+
+def _ensure_ready():
+    global _loop, _initialized
+    if _initialized:
+        return _loop
+    with _init_lock:
+        if _initialized:
+            return _loop
+        _loop = asyncio.new_event_loop()
+        t = threading.Thread(target=_loop.run_forever, daemon=True)
+        t.start()
+        f = asyncio.run_coroutine_threadsafe(telegram_app.initialize(), _loop)
+        f.result(timeout=30)
+        f = asyncio.run_coroutine_threadsafe(telegram_app.start(), _loop)
+        f.result(timeout=30)
+        _initialized = True
+        logger.info("Telegram app ready in worker process")
+        return _loop
 
 
 @app.route('/')
@@ -520,10 +531,11 @@ def index():
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     try:
+        loop = _ensure_ready()
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
         asyncio.run_coroutine_threadsafe(
-            telegram_app.process_update(update), _loop
+            telegram_app.process_update(update), loop
         )
         return Response(status=200)
     except Exception as e:

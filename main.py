@@ -398,7 +398,7 @@ def get_product_details_scraping(product_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.last_name or '')
-    start_text = "⚙️مرحبا بك في بوت التخفيض الخاص بالمتجر الصيني الشهير Aliexpress..."
+    start_text = "⚙️مرحبا بك في بوت التخفيض الخاص بالمتجر الصيني الشهير Aliexpress \n  \n ✅خصائص البوت:  \n ●توفير روابط عروض باسعار لاتجدها على الموقع \n ●له القدرة على جلب ست عروض مختلفة \n ●لذيه امكانية سحب ومعاينة السعر النهائي للمنتج \n ●يمكنه الحصول على نسبة التخفيض بالعملات وطبيعة الشحن \n ●يمكنه معرفة المنتج ان كان DDP ام لا (خاص بالاخوة المغاربة) \n ●امكانية الحصول على السعر بعملتي الدولار والدينار الجزائري \n ●معرفة عدد مبيعات المنتج وتقييمه بالاضافة الى تقييم المتجر \n  \n ✅طريقة استعمال البوت:  \n بطريقة بسيطة قم بنسخ رابط المنتج المراد شراؤه من موقع Aliexress من خلال رمز المشاركة الموجود في الاعلى (بالنسبة للتطبيق)، بعدها قم بلصق الرابط وارساله الى البوت، الان عليك النتظار ثواني قليلة ليقوم البوت بالتحضير والبحث عن العروض الممكنة، بعد حصولك على العروض اختر احسن سعر وقم باتمام عملية الشراء \n  \n ⛔ملاحظة: قم بتغيير الدولة في التطبيق (او الحساب)  إلى دولة كندا أو دولة اخرى أجنبية، مع ترك عنوان الشحن الخاص بك كما هو، وذالك للحصول على نسبة تخفيض أعلى في عرض العملات \n اي جديد تجدونه على قناتنا @rabahcopons"
     await update.message.reply_text(start_text)
 
 
@@ -456,7 +456,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error in handle_message: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء معالجة طلبك")
+        await update.message.reply_text("❌ حدث خطأ أثناء معالجة طلبك، اتصل بالأدمن @Rabahbelksier")
 
 
 async def product_details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,12 +479,12 @@ async def product_details_callback(update: Update, context: ContextTypes.DEFAULT
         data = send_api_request_with_retry(params, max_retries=3)
 
         if 'error_response' in data:
-            await status_message.edit_text(f"❌ خطأ من AliExpress: {data['error_response'].get('msg', 'خطأ غير معروف')}")
+            await status_message.edit_text(f"❌ خطأ من AliExpress: {data['error_response'].get('msg', 'خطأ غير معروف اتصل بالأدمن @Rabahbelksier')}")
             return
 
         info = parse_product_data(data)
         if not info:
-            await status_message.edit_text("⚠️ فشل في تحليل بيانات المنتج. قد يكون المنتج غير متاح في نظام الأفلييت.")
+            await status_message.edit_text("⚠️ لا يمكن جلب تفاصيل هذا المنتج")
             return
 
         await status_message.edit_text(format_product_message(info), parse_mode='Markdown', disable_web_page_preview=True)

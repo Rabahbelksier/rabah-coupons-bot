@@ -522,10 +522,9 @@ def webhook():
     try:
         json_data = request.get_json(force=True)
         update = Update.de_json(json_data, telegram_app.bot)
-        future = asyncio.run_coroutine_threadsafe(
+        asyncio.run_coroutine_threadsafe(
             telegram_app.process_update(update), _loop
         )
-        future.result(timeout=60)
         return Response(status=200)
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)

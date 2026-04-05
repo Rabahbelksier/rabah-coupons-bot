@@ -261,7 +261,7 @@ def generate_affiliate_links(product_id):
         return cache[cache_key]
 
     offers_primary = [
-        ("💥عرض المنتج في صفحة العملات", f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&productIds={product_id}"),
+        ("💥عرض المنتج في صفحة العملات", f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}"),
         ("💥رابط مباشر للمنتج", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=620"),
         ("💥عرض Super Deals", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=562"),
         ("💥عرض تخفيض Big Save", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=680"),
@@ -272,7 +272,7 @@ def generate_affiliate_links(product_id):
     ]
 
     offers_secondary = [
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&productIds={product_id}",
+        f"m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
         f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=620",
         f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=562",
         f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=680",

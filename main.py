@@ -118,8 +118,6 @@ def prepare_api_params(method, extra_params):
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
         'format': 'json',
         'v': '2.0',
-        'country' : 'DZ',
-        'currency' : 'USD',
     }
     params.update(extra_params)
     params['sign'] = generate_api_signature(params, APP_SECRET)

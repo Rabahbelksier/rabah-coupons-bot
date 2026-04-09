@@ -253,6 +253,57 @@ def generate_api_signature(params, secret):
     return hmac.new(secret.encode('utf-8'), param_string.encode('utf-8'), hashlib.sha256).hexdigest().upper()
 
 
+def _generate_single_link(url_to_try, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            params = {
+                "method": "aliexpress.affiliate.link.generate",
+                "app_key": APP_KEY,
+                "sign_method": "sha256",
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "v": "2.0",
+                "format": "json",
+                "tracking_id": TRACKING_ID,
+                "promotion_link_type": "0",
+                "source_values": url_to_try
+            }
+            params['sign'] = generate_api_signature(params, APP_SECRET)
+
+            response = requests.get(API_URL, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'error_response' in data:
+                err = data['error_response']
+                code = err.get('code', '')
+                msg = err.get('msg', '')
+                logger.warning(f"API error on link generation (attempt {attempt + 1}): [{code}] {msg}")
+                if code == 'ApiCallLimit':
+                    wait = 5.5 if '5 seconds' in msg else 1.5
+                    if attempt < max_retries - 1:
+                        time.sleep(wait)
+                        continue
+                return None
+
+            result = data.get('aliexpress_affiliate_link_generate_response', {}).get('resp_result', {}).get('result', {})
+            if result.get('promotion_links'):
+                return result['promotion_links']['promotion_link'][0]['promotion_link']
+            return None
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout generating link (attempt {attempt + 1}): {url_to_try}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+        except Exception as e:
+            logger.error(f"Error generating link (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+
+    return None
+
+
 def generate_affiliate_links(product_id):
     cache_key = f"links_{product_id}"
     if cache_key in cache:
@@ -280,37 +331,13 @@ def generate_affiliate_links(product_id):
         f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/ssr/300000512/BundleDeals2?&pha_manifest=ssr&productIds={product_id}",
     ]
 
-    def try_generate_link(url_to_try):
-        params = {
-            "method": "aliexpress.affiliate.link.generate",
-            "app_key": APP_KEY,
-            "sign_method": "sha256",
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "v": "2.0",
-            "format": "json",
-            "tracking_id": TRACKING_ID,
-            "promotion_link_type": "0",
-            "source_values": url_to_try
-        }
-        params['sign'] = generate_api_signature(params, APP_SECRET)
-
-        try:
-            response = requests.get(API_URL, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            result = data.get('aliexpress_affiliate_link_generate_response', {}).get('resp_result', {}).get('result', {})
-            if result.get('promotion_links'):
-                return result['promotion_links']['promotion_link'][0]['promotion_link']
-        except Exception as e:
-            logger.error(f"Error generating link: {e}")
-        return None
-
     results = []
     for i, (name, primary_url) in enumerate(offers_primary):
-        affiliate_link = try_generate_link(primary_url)
+        if i > 0:
+            time.sleep(0.4)
+        affiliate_link = _generate_single_link(primary_url)
         if affiliate_link is None and i < len(offers_secondary):
-            secondary_url = offers_secondary[i]
-            affiliate_link = try_generate_link(secondary_url)
+            affiliate_link = _generate_single_link(offers_secondary[i])
         if affiliate_link:
             results.append(f"{name}:\n{affiliate_link}")
         else:

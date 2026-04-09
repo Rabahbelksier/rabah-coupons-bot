@@ -11,7 +11,6 @@ import threading
 import psycopg2
 from datetime import datetime
 from bs4 import BeautifulSoup
-from functools import lru_cache
 from cachetools import TTLCache
 from flask import Flask, request, Response
 
@@ -36,6 +35,7 @@ if not all([APP_KEY, APP_SECRET, TRACKING_ID, TOKEN]):
 app = Flask(__name__)
 
 cache = TTLCache(maxsize=1000, ttl=300)
+cache_lock = threading.Lock()
 
 
 def get_db_connection():
@@ -218,8 +218,13 @@ def format_product_message(info):
 ⏰ *تم الاستخراج في: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}*"""
 
 
-@lru_cache(maxsize=100)
 def extract_product_id(text):
+    cache_key = f"pid_{text}"
+    with cache_lock:
+        cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         if not any(domain in text for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com']):
             return None
@@ -244,7 +249,10 @@ def extract_product_id(text):
     for pattern in patterns:
         match = re.search(pattern, final_url)
         if match:
-            return match.group(1)
+            result = match.group(1)
+            with cache_lock:
+                cache[cache_key] = result
+            return result
     return None
 
 
@@ -306,8 +314,10 @@ def _generate_single_link(url_to_try, max_retries=3):
 
 def generate_affiliate_links(product_id):
     cache_key = f"links_{product_id}"
-    if cache_key in cache:
-        return cache[cache_key]
+    with cache_lock:
+        cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     offers_primary = [
         ("💥عرض المنتج في صفحة العملات", f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}"),
@@ -343,12 +353,18 @@ def generate_affiliate_links(product_id):
         else:
             results.append(f"{name}:\n❌ فشل التوليد من المصدر")
 
-    cache[cache_key] = results
+    with cache_lock:
+        cache[cache_key] = results
     return results
 
 
-@lru_cache(maxsize=50)
 def get_product_details_scraping(product_id):
+    cache_key = f"scrape_{product_id}"
+    with cache_lock:
+        cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         url = f"https://www.aliexpress.com/item/{product_id}.html"
         headers = {
@@ -413,10 +429,14 @@ def get_product_details_scraping(product_id):
         if image_url and image_url.startswith('//'):
             image_url = f"https:{image_url}"
 
-        return {
+        result = {
             'title': title.strip()[:255] if title else None,
             'image_url': image_url
         }
+        if result.get('title') or result.get('image_url'):
+            with cache_lock:
+                cache[cache_key] = result
+        return result
     except Exception as e:
         logger.error(f"Error in scraping: {e}")
         return {'title': None, 'image_url': None}
@@ -450,6 +470,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await user_queues[chat_id].put(target_url)
 
     if chat_id not in active_workers:
+        active_workers.add(chat_id)
         asyncio.create_task(user_queue_worker(chat_id, context))
 
 
@@ -545,7 +566,6 @@ async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DE
 
 
 async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    active_workers.add(chat_id)
     queue = user_queues[chat_id]
     try:
         while not queue.empty():

@@ -404,8 +404,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(start_text)
 
 
+user_queues: dict = {}
+active_workers: set = set()
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text
+    chat_id = update.effective_chat.id
     url_pattern = r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     urls = re.findall(url_pattern, user_input)
 
@@ -414,51 +419,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ من فضلك قم بإرسال روابط منتجات Aliexpress فقط 😕")
         return
 
-    try:
-        product_id = extract_product_id(target_url)
-        if not product_id:
-            await update.message.reply_text("❌ انسخ رابط المنتج من تطبيق aliexpress او الموقع")
-            return
+    if chat_id not in user_queues:
+        user_queues[chat_id] = asyncio.Queue()
 
-        await update.message.reply_text("⏳ جاري البحث عن العروض")
+    await user_queues[chat_id].put(target_url)
 
-        product = get_product_info_from_api(product_id)
-
-        if not product or (not product.get('title') or product.get('title') == 'غير متوفر'):
-            logger.info(f"API returned insufficient data for {product_id}, trying scraping...")
-            scraped = get_product_details_scraping(product_id)
-            if not product:
-                product = {'title': None, 'image_url': None}
-            if scraped.get('title'):
-                product['title'] = product.get('title') if product.get('title') and product.get('title') != 'غير متوفر' else scraped['title']
-            if scraped.get('image_url') and not product.get('image_url'):
-                product['image_url'] = scraped['image_url']
-
-        links = generate_affiliate_links(product_id)
-
-        keyboard = [[InlineKeyboardButton("📋 تفاصيل المنتج الكاملة", callback_data=f"details_{product_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        title = product.get('title') if product and product.get('title') else None
-        image_url = product.get('image_url') if product else None
-
-        if title:
-            response_text = f"📦تخفيض على:\n {title}\n\n" + "\n\n".join(links)
-        else:
-            response_text = "📦 تخفيض على منتج AliExpress\n\n" + "\n\n".join(links)
-
-        if image_url:
-            try:
-                await update.message.reply_photo(photo=image_url, caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
-            except Exception as photo_err:
-                logger.error(f"Failed to send photo: {photo_err}")
-                await update.message.reply_text(response_text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(response_text, reply_markup=reply_markup)
-
-    except Exception as e:
-        logger.error(f"Error in handle_message: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء معالجة طلبك، اتصل بالأدمن @Rabahbelksier")
+    if chat_id not in active_workers:
+        asyncio.create_task(user_queue_worker(chat_id, context))
 
 
 async def product_details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,6 +461,74 @@ async def product_details_callback(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logger.error(f"Error in details callback: {e}")
         await query.message.reply_text("❌ حدث خطأ غير متوقع أثناء جلب التفاصيل.")
+
+
+async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot
+
+    product_id = await asyncio.to_thread(extract_product_id, url)
+    if not product_id:
+        await bot.send_message(chat_id=chat_id, text="❌ انسخ رابط المنتج من تطبيق aliexpress او الموقع")
+        return
+
+    loading_msg = await bot.send_message(chat_id=chat_id, text="⏳ جاري البحث عن العروض")
+
+    try:
+        product = await asyncio.to_thread(get_product_info_from_api, product_id)
+
+        if not product or (not product.get('title') or product.get('title') == 'غير متوفر'):
+            logger.info(f"API returned insufficient data for {product_id}, trying scraping...")
+            scraped = await asyncio.to_thread(get_product_details_scraping, product_id)
+            if not product:
+                product = {'title': None, 'image_url': None}
+            if scraped.get('title'):
+                product['title'] = product.get('title') if product.get('title') and product.get('title') != 'غير متوفر' else scraped['title']
+            if scraped.get('image_url') and not product.get('image_url'):
+                product['image_url'] = scraped['image_url']
+
+        links = await asyncio.to_thread(generate_affiliate_links, product_id)
+
+        keyboard = [[InlineKeyboardButton("📋 تفاصيل المنتج الكاملة", callback_data=f"details_{product_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        title = product.get('title') if product and product.get('title') else None
+        image_url = product.get('image_url') if product else None
+
+        if title:
+            response_text = f"📦تخفيض على:\n {title}\n\n" + "\n\n".join(links)
+        else:
+            response_text = "📦 تخفيض على منتج AliExpress\n\n" + "\n\n".join(links)
+
+        if image_url:
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=image_url, caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
+            except Exception as photo_err:
+                logger.error(f"Failed to send photo: {photo_err}")
+                await bot.send_message(chat_id=chat_id, text=response_text, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=response_text, reply_markup=reply_markup)
+
+    except Exception as e:
+        logger.error(f"Error processing link {url}: {e}")
+        await bot.send_message(chat_id=chat_id, text="❌ حدث خطأ أثناء معالجة طلبك، اتصل بالأدمن @Rabahbelksier")
+
+    finally:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=loading_msg.message_id)
+        except Exception:
+            pass
+
+
+async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    active_workers.add(chat_id)
+    queue = user_queues[chat_id]
+    try:
+        while not queue.empty():
+            url = queue.get_nowait()
+            await process_link_for_user(chat_id, url, context)
+            queue.task_done()
+    finally:
+        active_workers.discard(chat_id)
 
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()

@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import hashlib
+import html
 import requests
 import time
 import json
@@ -509,28 +510,6 @@ async def product_details_callback(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("❌ حدث خطأ غير متوقع أثناء جلب التفاصيل.")
 
 
-async def copy_title_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    product_id = query.data.split('_', 1)[1]
-
-    with cache_lock:
-        title = cache.get(f"title_{product_id}")
-
-    if not title:
-        product = await asyncio.to_thread(get_product_info_from_api, product_id)
-        title = product.get('title') if product else None
-        if title:
-            with cache_lock:
-                cache[f"title_{product_id}"] = title
-
-    if title:
-        await query.message.reply_text(title)
-    else:
-        await query.message.reply_text("⚠️ لا يمكن جلب عنوان هذا المنتج")
-
-
 async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
 
@@ -559,17 +538,11 @@ async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DE
         title = product.get('title') if product and product.get('title') else None
         image_url = product.get('image_url') if product else None
 
-        if title:
-            with cache_lock:
-                cache[f"title_{product_id}"] = title
-
         keyboard = [[InlineKeyboardButton("📋 تفاصيل المنتج الكاملة", callback_data=f"details_{product_id}")]]
-        if title:
-            keyboard.append([InlineKeyboardButton("📝 نسخ العنوان", callback_data=f"copytitle_{product_id}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         if title:
-            response_text = f"📦تخفيض على:\n {title}\n\n" + "\n\n".join(links)
+            response_text = f"📦تخفيض على:\n<code>{html.escape(title)}</code>\n\n" + "\n\n".join(links)
         else:
             response_text = "📦 تخفيض على منتج AliExpress\n\n" + "\n\n".join(links)
 
@@ -578,9 +551,9 @@ async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DE
                 await bot.send_photo(chat_id=chat_id, photo=image_url, caption=response_text, parse_mode="HTML", reply_markup=reply_markup)
             except Exception as photo_err:
                 logger.error(f"Failed to send photo: {photo_err}")
-                await bot.send_message(chat_id=chat_id, text=response_text, reply_markup=reply_markup)
+                await bot.send_message(chat_id=chat_id, text=response_text, parse_mode="HTML", reply_markup=reply_markup)
         else:
-            await bot.send_message(chat_id=chat_id, text=response_text, reply_markup=reply_markup)
+            await bot.send_message(chat_id=chat_id, text=response_text, parse_mode="HTML", reply_markup=reply_markup)
 
     except Exception as e:
         logger.error(f"Error processing link {url}: {e}")
@@ -608,7 +581,6 @@ telegram_app = Application.builder().token(TOKEN).updater(None).build()
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 telegram_app.add_handler(CallbackQueryHandler(product_details_callback, pattern="^details_"))
-telegram_app.add_handler(CallbackQueryHandler(copy_title_callback, pattern="^copytitle_"))
 
 _loop = None
 _initialized = False

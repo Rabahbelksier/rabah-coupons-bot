@@ -5,15 +5,16 @@ import hashlib
 import html
 import requests
 import time
-import json
 import logging
 import asyncio
 import threading
 import psycopg2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
 from flask import Flask, request, Response
+from requests.adapters import HTTPAdapter
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -38,6 +39,17 @@ app = Flask(__name__)
 cache = TTLCache(maxsize=1000, ttl=300)
 cache_lock = threading.Lock()
 
+# Shared HTTP session with connection pooling for reuse across calls
+_http_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
+_http_session.mount('http://', _adapter)
+_http_session.mount('https://', _adapter)
+
+# Thread pool for parallel affiliate link generation
+_link_executor = ThreadPoolExecutor(max_workers=10)
+
+
+# ─── Database ────────────────────────────────────────────────────────────────
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -83,32 +95,11 @@ def save_user(chat_id, first_name, last_name):
         logger.error(f"Error saving user: {e}")
 
 
-def send_api_request_with_retry(all_params, max_retries=2):
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(API_URL, data=all_params, timeout=10)
-            if response.status_code != 200:
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-                    continue
-            data = response.json()
-            if 'error_response' in data:
-                if data['error_response'].get('code') == 'ApiCallLimit':
-                    ban_time = 5 if '5 seconds' in data['error_response'].get('msg', '') else 1
-                    if attempt < max_retries - 1:
-                        time.sleep(ban_time + 0.5)
-                        continue
-                return data
-            return data
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-                continue
-        except Exception:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-    return {'error_response': {'code': 'MaxRetriesExceeded', 'msg': 'فشلت جميع المحاولات'}}
+# ─── API Helpers ──────────────────────────────────────────────────────────────
+
+def generate_api_signature(params, secret):
+    param_string = ''.join([f"{k}{v}" for k, v in sorted(params.items())])
+    return hmac.new(secret.encode('utf-8'), param_string.encode('utf-8'), hashlib.sha256).hexdigest().upper()
 
 
 def prepare_api_params(method, extra_params):
@@ -124,6 +115,36 @@ def prepare_api_params(method, extra_params):
     params['sign'] = generate_api_signature(params, APP_SECRET)
     return params
 
+
+def send_api_request_with_retry(all_params, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            response = _http_session.post(API_URL, data=all_params, timeout=8)
+            if response.status_code != 200:
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+            data = response.json()
+            if 'error_response' in data:
+                if data['error_response'].get('code') == 'ApiCallLimit':
+                    ban_time = 5 if '5 seconds' in data['error_response'].get('msg', '') else 1
+                    if attempt < max_retries - 1:
+                        time.sleep(ban_time + 0.5)
+                        continue
+                return data
+            return data
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                continue
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                continue
+    return {'error_response': {'code': 'MaxRetriesExceeded', 'msg': 'فشلت جميع المحاولات'}}
+
+
+# ─── Product Info ─────────────────────────────────────────────────────────────
 
 def parse_product_data(product_data):
     try:
@@ -175,11 +196,17 @@ def get_product_info_from_api(product_id):
             'tracking_id': TRACKING_ID,
             'fields': 'product_title,product_main_image_url'
         })
-        data = send_api_request_with_retry(params, max_retries=3)
+        data = send_api_request_with_retry(params, max_retries=2)
         if 'error_response' in data:
             logger.error(f"API error in get_product_info_from_api: {data['error_response'].get('msg', 'unknown')}")
             return None
-        product = data.get('aliexpress_affiliate_productdetail_get_response', {}).get('resp_result', {}).get('result', {}).get('products', {}).get('product')
+        product = (
+            data.get('aliexpress_affiliate_productdetail_get_response', {})
+                .get('resp_result', {})
+                .get('result', {})
+                .get('products', {})
+                .get('product')
+        )
         if not product:
             return None
         p = product[0] if isinstance(product, list) else product
@@ -219,6 +246,8 @@ def format_product_message(info):
 ⏰ *تم الاستخراج في: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}*"""
 
 
+# ─── URL / Product ID ─────────────────────────────────────────────────────────
+
 def extract_product_id(text):
     cache_key = f"pid_{text}"
     with cache_lock:
@@ -229,8 +258,7 @@ def extract_product_id(text):
     try:
         if not any(domain in text for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com']):
             return None
-        session = requests.Session()
-        response = session.head(text, allow_redirects=True, timeout=10)
+        response = _http_session.head(text, allow_redirects=True, timeout=8)
         final_url = response.url
     except Exception:
         final_url = text
@@ -257,12 +285,9 @@ def extract_product_id(text):
     return None
 
 
-def generate_api_signature(params, secret):
-    param_string = ''.join([f"{k}{v}" for k, v in sorted(params.items())])
-    return hmac.new(secret.encode('utf-8'), param_string.encode('utf-8'), hashlib.sha256).hexdigest().upper()
+# ─── Affiliate Link Generation ────────────────────────────────────────────────
 
-
-def _generate_single_link(url_to_try, max_retries=3):
+def _generate_single_link(url_to_try, max_retries=2):
     for attempt in range(max_retries):
         try:
             params = {
@@ -278,7 +303,7 @@ def _generate_single_link(url_to_try, max_retries=3):
             }
             params['sign'] = generate_api_signature(params, APP_SECRET)
 
-            response = requests.get(API_URL, params=params, timeout=15)
+            response = _http_session.get(API_URL, params=params, timeout=8)
             response.raise_for_status()
             data = response.json()
 
@@ -294,7 +319,11 @@ def _generate_single_link(url_to_try, max_retries=3):
                         continue
                 return None
 
-            result = data.get('aliexpress_affiliate_link_generate_response', {}).get('resp_result', {}).get('result', {})
+            result = (
+                data.get('aliexpress_affiliate_link_generate_response', {})
+                    .get('resp_result', {})
+                    .get('result', {})
+            )
             if result.get('promotion_links'):
                 return result['promotion_links']['promotion_link'][0]['promotion_link']
             return None
@@ -302,15 +331,25 @@ def _generate_single_link(url_to_try, max_retries=3):
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout generating link (attempt {attempt + 1}): {url_to_try}")
             if attempt < max_retries - 1:
-                time.sleep(2)
+                time.sleep(0.5)
                 continue
         except Exception as e:
             logger.error(f"Error generating link (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
     return None
+
+
+def _generate_one_offer(index, name, primary_url, secondary_url):
+    """Generate a single affiliate link, trying primary then secondary URL."""
+    affiliate_link = _generate_single_link(primary_url)
+    if affiliate_link is None and secondary_url:
+        affiliate_link = _generate_single_link(secondary_url)
+    if affiliate_link:
+        return index, f"{name}:\n{affiliate_link}"
+    return index, f"{name}:\n❌ فشل التوليد من المصدر"
 
 
 def generate_affiliate_links(product_id):
@@ -320,44 +359,74 @@ def generate_affiliate_links(product_id):
     if cached is not None:
         return cached
 
-    offers_primary = [
-        ("💥عرض المنتج في صفحة العملات", f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}"),
-        ("💥رابط مباشر للمنتج", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=620"),
-        ("💥عرض Super Deals", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=562"),
-        ("💥عرض تخفيض Big Save", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=680"),
-        ("💥عرض التخفيض المحدود", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=561"),
-        ("💥عرض التخفيض المحتمل", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=504"),
-        ("💥عرض مباشر للباندل ", f"https://www.aliexpress.com/item/{product_id}.html?sourceType=570"),
-        ("💥عرض المنتج في صفحة الباندل", f"https://www.aliexpress.com/ssr/300000512/BundleDeals2?&pha_manifest=ssr&productIds={product_id}")
+    offers = [
+        (
+            "💥عرض المنتج في صفحة العملات",
+            f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
+            f"m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
+        ),
+        (
+            "💥رابط مباشر للمنتج",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=620",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=620",
+        ),
+        (
+            "💥عرض Super Deals",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=562",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=562",
+        ),
+        (
+            "💥عرض تخفيض Big Save",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=680",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=680",
+        ),
+        (
+            "💥عرض التخفيض المحدود",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=561",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=561",
+        ),
+        (
+            "💥عرض التخفيض المحتمل",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=504",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=504",
+        ),
+        (
+            "💥عرض مباشر للباندل ",
+            f"https://www.aliexpress.com/item/{product_id}.html?sourceType=570",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=570",
+        ),
+        (
+            "💥عرض المنتج في صفحة الباندل",
+            f"https://www.aliexpress.com/ssr/300000512/BundleDeals2?&pha_manifest=ssr&productIds={product_id}",
+            f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/ssr/300000512/BundleDeals2?&pha_manifest=ssr&productIds={product_id}",
+        ),
     ]
 
-    offers_secondary = [
-        f"m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=620",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=562",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=680",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=561",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=504",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/item/{product_id}.html?sourceType=570",
-        f"https://star.aliexpress.com/share/share.htm?redirectUrl=https://www.aliexpress.com/ssr/300000512/BundleDeals2?&pha_manifest=ssr&productIds={product_id}",
-    ]
+    # Submit all 8 link-generation calls in parallel
+    futures = {
+        _link_executor.submit(_generate_one_offer, i, name, primary, secondary): i
+        for i, (name, primary, secondary) in enumerate(offers)
+    }
 
-    results = []
-    for i, (name, primary_url) in enumerate(offers_primary):
-        if i > 0:
-            time.sleep(0.4)
-        affiliate_link = _generate_single_link(primary_url)
-        if affiliate_link is None and i < len(offers_secondary):
-            affiliate_link = _generate_single_link(offers_secondary[i])
-        if affiliate_link:
-            results.append(f"{name}:\n{affiliate_link}")
-        else:
-            results.append(f"{name}:\n❌ فشل التوليد من المصدر")
+    results_map = {}
+    for future in as_completed(futures):
+        try:
+            index, text = future.result()
+            results_map[index] = text
+        except Exception as e:
+            idx = futures[future]
+            name = offers[idx][0]
+            results_map[idx] = f"{name}:\n❌ فشل التوليد من المصدر"
+            logger.error(f"Unexpected error for offer {idx}: {e}")
+
+    results = [results_map[i] for i in range(len(offers))]
 
     with cache_lock:
         cache[cache_key] = results
     return results
 
+
+# ─── Web Scraping Fallback ────────────────────────────────────────────────────
 
 def get_product_details_scraping(product_id):
     cache_key = f"scrape_{product_id}"
@@ -377,8 +446,7 @@ def get_product_details_scraping(product_id):
             "Referer": "https://www.aliexpress.com/",
         }
 
-        session = requests.Session()
-        response = session.get(url, headers=headers, timeout=20)
+        response = _http_session.get(url, headers=headers, timeout=12)
         response.raise_for_status()
 
         title = None
@@ -387,14 +455,16 @@ def get_product_details_scraping(product_id):
         try:
             script_tags = re.findall(r'<script[^>]*>(.*?)</script>', response.text, re.DOTALL)
             for script in script_tags:
-                title_match = re.search(r'"subject"\s*:\s*"([^"]+)"', script)
-                if title_match:
-                    title = title_match.group(1)
-                img_match = re.search(r'"imageUrl"\s*:\s*"([^"]+)"', script)
-                if not img_match:
-                    img_match = re.search(r'"imagePathList"\s*:\s*\[\s*"([^"]+)"', script)
-                if img_match:
-                    image_url = img_match.group(1)
+                if not title:
+                    title_match = re.search(r'"subject"\s*:\s*"([^"]+)"', script)
+                    if title_match:
+                        title = title_match.group(1)
+                if not image_url:
+                    img_match = re.search(r'"imageUrl"\s*:\s*"([^"]+)"', script)
+                    if not img_match:
+                        img_match = re.search(r'"imagePathList"\s*:\s*\[\s*"([^"]+)"', script)
+                    if img_match:
+                        image_url = img_match.group(1)
                 if title and image_url:
                     break
         except Exception as e:
@@ -443,36 +513,13 @@ def get_product_details_scraping(product_id):
         return {'title': None, 'image_url': None}
 
 
+# ─── Telegram Handlers ────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.first_name, user.last_name or '')
-    start_text = "⚙️مرحبا بك في بوت التخفيض الخاص بالمتجر الصيني الشهير Aliexpress \n  \n ✅خصائص البوت:  \n ●توفير روابط عروض باسعار لاتجدها على الموقع \n ●له القدرة على جلب ست عروض مختلفة \n ●لذيه امكانية سحب ومعاينة السعر النهائي للمنتج \n ●يمكنه الحصول على نسبة التخفيض بالعملات وطبيعة الشحن \n ●يمكنه معرفة المنتج ان كان DDP ام لا (خاص بالاخوة المغاربة) \n ●امكانية الحصول على السعر بعملتي الدولار والدينار الجزائري \n ●معرفة عدد مبيعات المنتج وتقييمه بالاضافة الى تقييم المتجر \n  \n ✅طريقة استعمال البوت:  \n بطريقة بسيطة قم بنسخ رابط المنتج المراد شراؤه من موقع Aliexress من خلال رمز المشاركة الموجود في الاعلى (بالنسبة للتطبيق)، بعدها قم بلصق الرابط وارساله الى البوت، الان عليك النتظار ثواني قليلة ليقوم البوت بالتحضير والبحث عن العروض الممكنة، بعد حصولك على العروض اختر احسن سعر وقم باتمام عملية الشراء \n  \n ⛔ملاحظة: قم بتغيير الدولة في التطبيق (او الحساب)  إلى دولة كندا أو دولة اخرى أجنبية، مع ترك عنوان الشحن الخاص بك كما هو، وذالك للحصول على نسبة تخفيض أعلى في عرض العملات \n اي جديد تجدونه على قناتنا @rabahcopons"
+    start_text = "⚙️مرحبا بك في بوت التخفيض الخاص بالمتجر الصيني الشهير Aliexpress \n  \n ✅خصائص البوت:  \n ●توفير روابط عروض باسعار لاتجدها على الموقع \n ●له القدرة على جلب ست عروض مختلفة \n ●لذيه امكانية سحب ومعاينة السعر النهائي للمنتج \n ●يمكنه الحصول على نسبة التخفيض بالعملات وطبيعة الشحن \n ●يمكنه معرفة المنتج ان كان DDP ام لا (خاص بالاخوة المغاربة) \n ●امكانية الحصول على السعر بعملتي الدولار والدينار الجزائري \n ●معرفة عدد مبيعات المنتج وتقييمه بالاضافة الى تقييم المتجر \n  \n ✅طريقة استعمال البوت:  \n بطريقة بسيطة قم بنسخ رابط المنتج المراد شراؤه من موقع Aliexress من خلال رمز المشاركة الموجود في الاعلى (بالنسبة للتطبيق)، بعدها قم بلصق الرابط وارساله الى البوت، الان عليك النتظار ثواني قليلة ليقوم البوت بالتحضير والبحث عن العروض الممكنة، بعد حصولك على العروض اختر احسن سعر وقم باتمام عملية الشراء \n  \n ⛔ملاحظة: قم بتغيير الدولة في التطبيق (او الحساب)  إلى دولة كندا أو دولة اخرى أجنبية، مع ترك عنوان الشحن الخاص بك كما هو، وذالك للحصول على نسبة تخفيض أعلى في عرض العملات \n اي جديد تجدونه على قناتنا @rabahcopons"
     await update.message.reply_text(start_text)
-
-
-user_queues: dict = {}
-active_workers: set = set()
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text
-    chat_id = update.effective_chat.id
-    url_pattern = r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-    urls = re.findall(url_pattern, user_input)
-
-    target_url = next((url for url in urls if any(domain in url for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com'])), None)
-    if not target_url:
-        await update.message.reply_text("⚠️ من فضلك قم بإرسال روابط منتجات Aliexpress فقط 😕")
-        return
-
-    if chat_id not in user_queues:
-        user_queues[chat_id] = asyncio.Queue()
-
-    await user_queues[chat_id].put(target_url)
-
-    if chat_id not in active_workers:
-        active_workers.add(chat_id)
-        asyncio.create_task(user_queue_worker(chat_id, context))
 
 
 async def product_details_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,19 +568,26 @@ async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DE
     loading_msg = await bot.send_message(chat_id=chat_id, text="⏳ جاري البحث عن العروض")
 
     try:
-        product = await asyncio.to_thread(get_product_info_from_api, product_id)
+        # Run product info fetch and affiliate link generation concurrently
+        product_task = asyncio.to_thread(get_product_info_from_api, product_id)
+        links_task = asyncio.to_thread(generate_affiliate_links, product_id)
 
+        product, links = await asyncio.gather(product_task, links_task)
+
+        # If the API returned no useful product info, fall back to scraping
         if not product or (not product.get('title') or product.get('title') == 'غير متوفر'):
             logger.info(f"API returned insufficient data for {product_id}, trying scraping...")
             scraped = await asyncio.to_thread(get_product_details_scraping, product_id)
             if not product:
                 product = {'title': None, 'image_url': None}
             if scraped.get('title'):
-                product['title'] = product.get('title') if product.get('title') and product.get('title') != 'غير متوفر' else scraped['title']
+                product['title'] = (
+                    product.get('title')
+                    if product.get('title') and product.get('title') != 'غير متوفر'
+                    else scraped['title']
+                )
             if scraped.get('image_url') and not product.get('image_url'):
                 product['image_url'] = scraped['image_url']
-
-        links = await asyncio.to_thread(generate_affiliate_links, product_id)
 
         title = product.get('title') if product and product.get('title') else None
         image_url = product.get('image_url') if product else None
@@ -566,6 +620,34 @@ async def process_link_for_user(chat_id: int, url: str, context: ContextTypes.DE
             pass
 
 
+user_queues: dict = {}
+active_workers: set = set()
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text
+    chat_id = update.effective_chat.id
+    url_pattern = r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+    urls = re.findall(url_pattern, user_input)
+
+    target_url = next(
+        (url for url in urls if any(domain in url for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com'])),
+        None
+    )
+    if not target_url:
+        await update.message.reply_text("⚠️ من فضلك قم بإرسال روابط منتجات Aliexpress فقط 😕")
+        return
+
+    if chat_id not in user_queues:
+        user_queues[chat_id] = asyncio.Queue()
+
+    await user_queues[chat_id].put(target_url)
+
+    if chat_id not in active_workers:
+        active_workers.add(chat_id)
+        asyncio.create_task(user_queue_worker(chat_id, context))
+
+
 async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     queue = user_queues[chat_id]
     try:
@@ -576,6 +658,8 @@ async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     finally:
         active_workers.discard(chat_id)
 
+
+# ─── Flask / Webhook ──────────────────────────────────────────────────────────
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 telegram_app.add_handler(CommandHandler("start", start))

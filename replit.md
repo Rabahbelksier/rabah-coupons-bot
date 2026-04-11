@@ -45,8 +45,16 @@ Telegram bot that generates affiliate links for AliExpress products. Users send 
 - `requirements.txt`: Python dependencies
 - `Procfile`: `web: gunicorn main:app`
 
+## Performance
+- **Parallel link generation**: All 8 affiliate link API calls run concurrently via `ThreadPoolExecutor` (was sequential with 0.4s sleep between each call)
+- **Concurrent product fetch + link generation**: `get_product_info_from_api` and `generate_affiliate_links` run simultaneously via `asyncio.gather`
+- **Shared HTTP session**: Single `requests.Session` with connection pool (`pool_maxsize=50`) reused across all calls — eliminates per-request connection overhead
+- **Reduced timeouts**: API calls 8s (was 10-15s), scraping 12s (was 20s)
+- **Scraping only blocks if API fails**: Links are always generated in parallel, scraping runs after if needed
+
 ## Recent Changes
 - 2026-02-12: Converted from polling to Webhook mode with Flask
 - 2026-02-12: Added PostgreSQL database integration for user storage
 - 2026-02-12: Created Procfile and updated requirements.txt for Render.com deployment
 - 2026-02-12: Added save_user function with ON CONFLICT DO NOTHING for duplicate prevention
+- 2026-04-11: Major performance optimization — parallel link generation + concurrent product fetch/links

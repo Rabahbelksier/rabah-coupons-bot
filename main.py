@@ -363,7 +363,7 @@ def generate_affiliate_links(product_id):
         (
             "💥عرض المنتج في صفحة العملات",
             f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
-            f"m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
+            f"https://m.aliexpress.com/p/coin-index/index.html?_immersiveMode=true&tabname=configTab_1926001&productIds={product_id}",
         ),
         (
             "💥رابط مباشر للمنتج",

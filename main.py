@@ -36,17 +36,23 @@ if not all([APP_KEY, APP_SECRET, TRACKING_ID, TOKEN]):
 
 app = Flask(__name__)
 
-cache = TTLCache(maxsize=1000, ttl=300)
+# Reduced maxsize (400 vs 1000) and doubled TTL (600 vs 300) to lower RAM usage
+cache = TTLCache(maxsize=400, ttl=600)
 cache_lock = threading.Lock()
 
-# Shared HTTP session with connection pooling for reuse across calls
+# Separate cache for scraping results with much longer TTL (3600s) to reduce re-scraping
+scrape_cache = TTLCache(maxsize=200, ttl=3600)
+scrape_cache_lock = threading.Lock()
+
+# Shared HTTP session with improved connection pooling for better reuse and lower latency
 _http_session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
+_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
 _http_session.mount('http://', _adapter)
 _http_session.mount('https://', _adapter)
+_http_session.headers.update({'Connection': 'keep-alive'})
 
-# Thread pool for parallel affiliate link generation
-_link_executor = ThreadPoolExecutor(max_workers=10)
+# Reduced thread pool (5 vs 10) to lower CPU pressure and prevent API burst
+_link_executor = ThreadPoolExecutor(max_workers=5)
 
 
 # ─── Database ────────────────────────────────────────────────────────────────
@@ -248,41 +254,60 @@ def format_product_message(info):
 
 # ─── URL / Product ID ─────────────────────────────────────────────────────────
 
+_URL_PATTERNS = [
+    r'[?&]productIds=(\d+)',
+    r'[?&]productId=(\d+)',
+    r'/item/(\d+)\.(?:html|htm)',
+    r'/item/(\d+)(?:\?|$)',
+    r'/product/(\d+)',
+    r'/i/(\d+)',
+    r'/p/[^/]+/index\.html[?&]productIds=(\d+)',
+    r'/ssr/.*?[?&]productIds=(\d+)',
+    r'/[a-z0-9]+\.html\?.*?productId(?:s)?=(\d+)',
+]
+
+
+def _match_product_id_from_url(url):
+    for pattern in _URL_PATTERNS:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
 def extract_product_id(text):
     cache_key = f"pid_{text}"
-    with cache_lock:
+
+    # Lock-free read — safe under Python GIL for TTLCache get
+    try:
         cached = cache.get(cache_key)
+    except Exception:
+        cached = None
     if cached is not None:
         return cached
 
+    if not any(domain in text for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com']):
+        return None
+
+    # Try to extract product ID directly from the input URL first (no HTTP call needed)
+    direct_match = _match_product_id_from_url(text)
+    if direct_match:
+        with cache_lock:
+            cache[cache_key] = direct_match
+        return direct_match
+
+    # Only perform HEAD request if direct pattern matching failed
     try:
-        if not any(domain in text for domain in ['aliexpress.com', 'alix.live', 's.click.aliexpress.com']):
-            return None
         response = _http_session.head(text, allow_redirects=True, timeout=8)
         final_url = response.url
     except Exception:
         final_url = text
 
-    patterns = [
-        r'[?&]productIds=(\d+)',
-        r'[?&]productId=(\d+)',
-        r'/item/(\d+)\.(?:html|htm)',
-        r'/item/(\d+)(?:\?|$)',
-        r'/product/(\d+)',
-        r'/i/(\d+)',
-        r'/p/[^/]+/index\.html[?&]productIds=(\d+)',
-        r'/ssr/.*?[?&]productIds=(\d+)',
-        r'/[a-z0-9]+\.html\?.*?productId(?:s)?=(\d+)',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, final_url)
-        if match:
-            result = match.group(1)
-            with cache_lock:
-                cache[cache_key] = result
-            return result
-    return None
+    result = _match_product_id_from_url(final_url)
+    if result:
+        with cache_lock:
+            cache[cache_key] = result
+    return result
 
 
 # ─── Affiliate Link Generation ────────────────────────────────────────────────
@@ -354,8 +379,12 @@ def _generate_one_offer(index, name, primary_url, secondary_url):
 
 def generate_affiliate_links(product_id):
     cache_key = f"links_{product_id}"
-    with cache_lock:
+
+    # Lock-free read — safe under Python GIL for TTLCache get
+    try:
         cached = cache.get(cache_key)
+    except Exception:
+        cached = None
     if cached is not None:
         return cached
 
@@ -402,22 +431,25 @@ def generate_affiliate_links(product_id):
         ),
     ]
 
-    # Submit all 8 link-generation calls in parallel
-    futures = {
-        _link_executor.submit(_generate_one_offer, i, name, primary, secondary): i
-        for i, (name, primary, secondary) in enumerate(offers)
-    }
-
     results_map = {}
-    for future in as_completed(futures):
-        try:
-            index, text = future.result()
-            results_map[index] = text
-        except Exception as e:
-            idx = futures[future]
-            name = offers[idx][0]
-            results_map[idx] = f"{name}:\n❌ فشل التوليد من المصدر"
-            logger.error(f"Unexpected error for offer {idx}: {e}")
+    batch_size = 4
+
+    # Process offers in batches to avoid bursting all 8 requests simultaneously
+    for batch_start in range(0, len(offers), batch_size):
+        batch = offers[batch_start:batch_start + batch_size]
+        futures = {
+            _link_executor.submit(_generate_one_offer, batch_start + j, name, primary, secondary): batch_start + j
+            for j, (name, primary, secondary) in enumerate(batch)
+        }
+        for future in as_completed(futures):
+            try:
+                index, text = future.result()
+                results_map[index] = text
+            except Exception as e:
+                idx = futures[future]
+                name = offers[idx][0]
+                results_map[idx] = f"{name}:\n❌ فشل التوليد من المصدر"
+                logger.error(f"Unexpected error for offer {idx}: {e}")
 
     results = [results_map[i] for i in range(len(offers))]
 
@@ -430,8 +462,12 @@ def generate_affiliate_links(product_id):
 
 def get_product_details_scraping(product_id):
     cache_key = f"scrape_{product_id}"
-    with cache_lock:
-        cached = cache.get(cache_key)
+
+    # Lock-free read from scrape_cache (separate long-lived cache, TTL=3600)
+    try:
+        cached = scrape_cache.get(cache_key)
+    except Exception:
+        cached = None
     if cached is not None:
         return cached
 
@@ -505,8 +541,8 @@ def get_product_details_scraping(product_id):
             'image_url': image_url
         }
         if result.get('title') or result.get('image_url'):
-            with cache_lock:
-                cache[cache_key] = result
+            with scrape_cache_lock:
+                scrape_cache[cache_key] = result
         return result
     except Exception as e:
         logger.error(f"Error in scraping: {e}")
@@ -649,7 +685,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    queue = user_queues[chat_id]
+    queue = user_queues.get(chat_id)
+    if queue is None:
+        active_workers.discard(chat_id)
+        return
     try:
         while not queue.empty():
             url = queue.get_nowait()
@@ -657,6 +696,9 @@ async def user_queue_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             queue.task_done()
     finally:
         active_workers.discard(chat_id)
+        # Clean up queue to prevent memory leaks from inactive users
+        if chat_id in user_queues and user_queues[chat_id].empty():
+            del user_queues[chat_id]
 
 
 # ─── Flask / Webhook ──────────────────────────────────────────────────────────

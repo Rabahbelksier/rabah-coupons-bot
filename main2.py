@@ -1,9 +1,8 @@
-import os
 import logging
 import asyncio
 import threading
 import requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
@@ -12,14 +11,11 @@ from core.db import init_db
 from handlers.start import start
 from handlers.messages import handle_message
 from handlers.callbacks import product_details_callback
-from core.scraper import get_product_details_scraping
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-SCRAPE_API_KEY = os.getenv('SCRAPE_API_KEY', '')
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 telegram_app.add_handler(CommandHandler("start", start))
@@ -68,24 +64,6 @@ def webhook():
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
         return Response(status=200)
-
-
-@app.route('/scrape', methods=['GET'])
-def scrape_product():
-    key = request.args.get('key', '')
-    if SCRAPE_API_KEY and key != SCRAPE_API_KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    product_id = request.args.get('product_id', '').strip()
-    if not product_id:
-        return jsonify({'error': 'product_id required'}), 400
-
-    logger.info(f"Scrape request for product_id: {product_id}")
-    result = get_product_details_scraping(product_id)
-    return jsonify({
-        'title': result.get('title'),
-        'image_url': result.get('image_url')
-    })
 
 
 def set_webhook():
